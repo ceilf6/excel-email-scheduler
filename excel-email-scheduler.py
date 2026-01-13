@@ -21,8 +21,10 @@ import json
 import logging
 import os
 import re
+import signal
 import smtplib
 import sys
+import time
 from abc import ABC, abstractmethod
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -511,6 +513,48 @@ def load_config(config_path: str) -> dict:
         return yaml.safe_load(f)
 
 
+def load_processed_files(record_path: str) -> dict:
+    """
+    Load the record of processed files.
+
+    Args:
+        record_path: Path to the processed files record JSON
+
+    Returns:
+        Dictionary with file paths as keys and processing info as values
+    """
+    if os.path.exists(record_path):
+        with open(record_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return {}
+
+
+def save_processed_files(record_path: str, processed: dict) -> None:
+    """
+    Save the record of processed files.
+
+    Args:
+        record_path: Path to the processed files record JSON
+        processed: Dictionary with file paths as keys and processing info as values
+    """
+    with open(record_path, "w", encoding="utf-8") as f:
+        json.dump(processed, f, indent=2, ensure_ascii=False)
+
+
+def get_file_signature(file_path: Path) -> str:
+    """
+    Get a signature for a file based on its modification time and size.
+
+    Args:
+        file_path: Path to the file
+
+    Returns:
+        String signature combining mtime and size
+    """
+    stat = file_path.stat()
+    return f"{stat.st_mtime}_{stat.st_size}"
+
+
 def find_xlsx_files(workspace_path: str) -> list[Path]:
     """
     Find all xlsx files in the workspace directory.
@@ -704,6 +748,170 @@ def process_xlsx_file(
     return stats
 
 
+def find_new_xlsx_files(
+    workspace_path: str,
+    processed_record: dict,
+    logger: logging.Logger
+) -> list[Path]:
+    """
+    Find xlsx files that are new or modified since last processing.
+
+    Args:
+        workspace_path: Path to the workspace directory
+        processed_record: Dictionary of previously processed files
+        logger: Logger instance
+
+    Returns:
+        List of new/modified xlsx file paths
+    """
+    all_files = find_xlsx_files(workspace_path)
+    new_files = []
+
+    for file_path in all_files:
+        file_key = str(file_path.absolute())
+        current_signature = get_file_signature(file_path)
+
+        if file_key not in processed_record:
+            logger.debug(f"New file detected: {file_path.name}")
+            new_files.append(file_path)
+        elif processed_record[file_key].get("signature") != current_signature:
+            logger.debug(f"Modified file detected: {file_path.name}")
+            new_files.append(file_path)
+
+    return new_files
+
+
+def process_new_files(
+    config: dict,
+    sender: EmailSender,
+    logger: logging.Logger,
+    dry_run: bool = False
+) -> dict[str, int]:
+    """
+    Check for and process new xlsx files.
+
+    Args:
+        config: Configuration dictionary
+        sender: EmailSender instance
+        logger: Logger instance
+        dry_run: Whether in dry run mode
+
+    Returns:
+        Dictionary with statistics (sent, failed, skipped, files_processed)
+    """
+    workspace_path = config.get("workspace", {}).get("path", "./workspace")
+    scheduler_config = config.get("scheduler", {})
+    record_path = scheduler_config.get("processed_files_record", "./processed_files.json")
+
+    # Load processed files record
+    processed_record = load_processed_files(record_path)
+
+    # Find new files
+    try:
+        new_files = find_new_xlsx_files(workspace_path, processed_record, logger)
+    except FileNotFoundError as e:
+        logger.error(str(e))
+        return {"sent": 0, "failed": 0, "skipped": 0, "files_processed": 0}
+
+    if not new_files:
+        logger.debug("No new xlsx files found")
+        return {"sent": 0, "failed": 0, "skipped": 0, "files_processed": 0}
+
+    logger.info(f"Found {len(new_files)} new/modified xlsx file(s) to process")
+
+    total_stats = {"sent": 0, "failed": 0, "skipped": 0, "files_processed": 0}
+
+    for xlsx_file in new_files:
+        logger.info(f"Processing: {xlsx_file.name}")
+        stats = process_xlsx_file(xlsx_file, config, sender, logger)
+
+        for key in ["sent", "failed", "skipped"]:
+            total_stats[key] += stats[key]
+
+        # Mark file as processed
+        file_key = str(xlsx_file.absolute())
+        processed_record[file_key] = {
+            "signature": get_file_signature(xlsx_file),
+            "processed_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "stats": stats
+        }
+        total_stats["files_processed"] += 1
+
+        # Save after each file in case of interruption
+        if not dry_run:
+            save_processed_files(record_path, processed_record)
+
+    return total_stats
+
+
+# Global flag for graceful shutdown
+_shutdown_requested = False
+
+
+def _signal_handler(signum, frame):
+    """Handle shutdown signals."""
+    global _shutdown_requested
+    _shutdown_requested = True
+
+
+def run_scheduler(config: dict, logger: logging.Logger, dry_run: bool = False) -> None:
+    """
+    Run the scheduler loop to periodically check for new xlsx files.
+
+    Args:
+        config: Configuration dictionary
+        logger: Logger instance
+        dry_run: Whether in dry run mode
+    """
+    global _shutdown_requested
+
+    scheduler_config = config.get("scheduler", {})
+    check_interval = scheduler_config.get("check_interval", 86400)  # Default: 1 day
+
+    logger.info("=" * 50)
+    logger.info("Starting Email Scheduler in watch mode")
+    logger.info(f"Check interval: {check_interval} seconds ({check_interval / 3600:.1f} hours)")
+    logger.info("Press Ctrl+C to stop")
+    logger.info("=" * 50)
+
+    # Setup signal handlers for graceful shutdown
+    signal.signal(signal.SIGINT, _signal_handler)
+    signal.signal(signal.SIGTERM, _signal_handler)
+
+    # Create email sender
+    try:
+        sender = create_email_sender(config, logger, dry_run)
+    except Exception as e:
+        logger.error(f"Failed to initialize email sender: {e}")
+        return
+
+    try:
+        while not _shutdown_requested:
+            logger.info("Checking for new xlsx files...")
+
+            stats = process_new_files(config, sender, logger, dry_run)
+
+            if stats["files_processed"] > 0:
+                logger.info(f"Processed {stats['files_processed']} file(s): "
+                           f"sent={stats['sent']}, failed={stats['failed']}, skipped={stats['skipped']}")
+            else:
+                logger.info("No new files to process")
+
+            # Wait for next check interval
+            logger.info(f"Next check in {check_interval} seconds...")
+
+            # Sleep in small intervals to allow for graceful shutdown
+            sleep_interval = min(check_interval, 10)
+            elapsed = 0
+            while elapsed < check_interval and not _shutdown_requested:
+                time.sleep(sleep_interval)
+                elapsed += sleep_interval
+
+    finally:
+        sender.close()
+        logger.info("Scheduler stopped")
+
+
 def main():
     """Main entry point for the email scheduler."""
     # Parse command line arguments
@@ -719,6 +927,11 @@ def main():
         "--dry-run",
         action="store_true",
         help="Preview emails without sending"
+    )
+    parser.add_argument(
+        "--watch",
+        action="store_true",
+        help="Run in watch mode: periodically check for new xlsx files"
     )
     args = parser.parse_args()
 
@@ -741,51 +954,59 @@ def main():
     if dry_run:
         logger.info("Running in DRY RUN mode - no emails will be sent")
 
-    # Create email sender
-    try:
-        sender = create_email_sender(config, logger, dry_run)
-    except Exception as e:
-        logger.error(f"Failed to initialize email sender: {e}")
-        sys.exit(1)
+    # Check if watch mode is requested (CLI argument or config)
+    scheduler_config = config.get("scheduler", {})
+    watch_mode = args.watch or scheduler_config.get("enabled", False)
 
-    # Find xlsx files
-    workspace_path = config.get("workspace", {}).get("path", "./workspace")
+    if watch_mode:
+        run_scheduler(config, logger, dry_run)
+    else:
+        # Original one-time processing mode
+        # Create email sender
+        try:
+            sender = create_email_sender(config, logger, dry_run)
+        except Exception as e:
+            logger.error(f"Failed to initialize email sender: {e}")
+            sys.exit(1)
 
-    try:
-        xlsx_files = find_xlsx_files(workspace_path)
-    except FileNotFoundError as e:
-        logger.error(str(e))
-        sys.exit(1)
+        # Find xlsx files
+        workspace_path = config.get("workspace", {}).get("path", "./workspace")
 
-    if not xlsx_files:
-        logger.warning(f"No xlsx files found in {workspace_path}")
-        sys.exit(0)
+        try:
+            xlsx_files = find_xlsx_files(workspace_path)
+        except FileNotFoundError as e:
+            logger.error(str(e))
+            sys.exit(1)
 
-    logger.info(f"Found {len(xlsx_files)} xlsx file(s) to process")
+        if not xlsx_files:
+            logger.warning(f"No xlsx files found in {workspace_path}")
+            sys.exit(0)
 
-    # Process each xlsx file
-    total_stats = {"sent": 0, "failed": 0, "skipped": 0}
+        logger.info(f"Found {len(xlsx_files)} xlsx file(s) to process")
 
-    try:
-        for xlsx_file in xlsx_files:
-            logger.info(f"Processing: {xlsx_file.name}")
-            stats = process_xlsx_file(xlsx_file, config, sender, logger)
+        # Process each xlsx file
+        total_stats = {"sent": 0, "failed": 0, "skipped": 0}
 
-            for key in total_stats:
-                total_stats[key] += stats[key]
-    finally:
-        # Clean up sender resources
-        sender.close()
+        try:
+            for xlsx_file in xlsx_files:
+                logger.info(f"Processing: {xlsx_file.name}")
+                stats = process_xlsx_file(xlsx_file, config, sender, logger)
 
-    # Print summary
-    logger.info("=" * 50)
-    logger.info("Processing Complete!")
-    logger.info(f"Total emails sent: {total_stats['sent']}")
-    logger.info(f"Total emails failed: {total_stats['failed']}")
-    logger.info(f"Total emails skipped: {total_stats['skipped']}")
+                for key in total_stats:
+                    total_stats[key] += stats[key]
+        finally:
+            # Clean up sender resources
+            sender.close()
 
-    if total_stats["failed"] > 0:
-        sys.exit(1)
+        # Print summary
+        logger.info("=" * 50)
+        logger.info("Processing Complete!")
+        logger.info(f"Total emails sent: {total_stats['sent']}")
+        logger.info(f"Total emails failed: {total_stats['failed']}")
+        logger.info(f"Total emails skipped: {total_stats['skipped']}")
+
+        if total_stats["failed"] > 0:
+            sys.exit(1)
 
 
 if __name__ == "__main__":

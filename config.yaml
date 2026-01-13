@@ -105,6 +105,18 @@ logging:
   file: "./email_scheduler.log"
 
 # =============================================================================
+# Scheduler Settings
+# =============================================================================
+scheduler:
+  # Enable scheduled checking for new xlsx files
+  enabled: false
+  # Check interval in seconds (default: 86400 = 1 day)
+  # Examples: 3600 = 1 hour, 86400 = 1 day, 604800 = 1 week
+  check_interval: 86400
+  # File to track processed xlsx files (to avoid re-processing)
+  processed_files_record: "./processed_files.json"
+
+# =============================================================================
 # Dry Run Mode
 # Set to true to preview emails without sending
 # =============================================================================
