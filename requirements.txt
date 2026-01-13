@@ -1,3 +1,11 @@
 # Excel Email Scheduler Dependencies
 openpyxl>=3.1.0
 PyYAML>=6.0
+
+# OAuth2 Dependencies
+# For Gmail OAuth2
+google-auth-oauthlib>=1.0.0
+google-auth>=2.0.0
+
+# For Outlook/Office365 OAuth2
+msal>=1.20.0

@@ -1,6 +1,16 @@
 # Email Scheduler Configuration
 
-# SMTP Server Settings
+# =============================================================================
+# Authentication Type: Choose one of the following
+# - "basic": Traditional SMTP with username/password (for QQ, 163, etc.)
+# - "gmail_oauth2": Google OAuth2 (for Gmail)
+# - "outlook_oauth2": Microsoft OAuth2 (for Outlook/Office365)
+# =============================================================================
+auth_type: "basic"
+
+# =============================================================================
+# Basic SMTP Authentication (for QQ Mail, 163 Mail, etc.)
+# =============================================================================
 smtp:
   host: "smtp.example.com"
   port: 587
@@ -8,7 +18,61 @@ smtp:
   username: "your_email@example.com"
   password: "your_password"
 
+# =============================================================================
+# Gmail OAuth2 Configuration
+#
+# Setup Instructions:
+# 1. Go to Google Cloud Console: https://console.cloud.google.com/
+# 2. Create a new project or select existing one
+# 3. Enable Gmail API: APIs & Services > Library > Gmail API > Enable
+# 4. Create OAuth2 credentials:
+#    - APIs & Services > Credentials > Create Credentials > OAuth client ID
+#    - Application type: Desktop app
+#    - Download the JSON file and save as 'gmail_credentials.json'
+# 5. First run will open browser for authorization
+# =============================================================================
+gmail_oauth2:
+  # Path to the OAuth2 credentials JSON file downloaded from Google Cloud Console
+  credentials_file: "gmail_credentials.json"
+  # Path to store the token (auto-generated after first authorization)
+  token_file: "gmail_token.json"
+  # OAuth2 scopes required for sending emails
+  scopes:
+    - "https://www.googleapis.com/auth/gmail.send"
+
+# =============================================================================
+# Outlook/Office365 OAuth2 Configuration
+#
+# Setup Instructions:
+# 1. Go to Azure Portal: https://portal.azure.com/
+# 2. Navigate to: Azure Active Directory > App registrations > New registration
+# 3. Register your application:
+#    - Name: Email Scheduler (or your preferred name)
+#    - Supported account types: Choose based on your needs
+#    - Redirect URI: http://localhost (for desktop apps)
+# 4. After creation, note the Application (client) ID
+# 5. Go to: Certificates & secrets > New client secret
+#    - Copy the secret value (shown only once!)
+# 6. Go to: API permissions > Add permission > Microsoft Graph
+#    - Add: Mail.Send (Delegated)
+#    - Click "Grant admin consent" if required
+# =============================================================================
+outlook_oauth2:
+  # Application (client) ID from Azure Portal
+  client_id: "your_client_id"
+  # Client secret from Azure Portal
+  client_secret: "your_client_secret"
+  # Tenant ID (use 'common' for multi-tenant, or specific tenant ID)
+  tenant_id: "common"
+  # Path to store the token cache
+  token_cache_file: "outlook_token_cache.json"
+  # OAuth2 scopes required for sending emails
+  scopes:
+    - "https://graph.microsoft.com/Mail.Send"
+
+# =============================================================================
 # Email Settings
+# =============================================================================
 email:
   # Sender email address
   from_address: "your_email@example.com"
@@ -24,17 +88,24 @@ email:
     Best regards,
     Your Team
 
+# =============================================================================
 # Workspace Settings
+# =============================================================================
 workspace:
   # Directory containing xlsx files to process
   path: "./workspace"
 
+# =============================================================================
 # Logging Settings
+# =============================================================================
 logging:
   # Log level: DEBUG, INFO, WARNING, ERROR
   level: "INFO"
   # Log file path (optional, leave empty to disable file logging)
   file: "./email_scheduler.log"
 
-# Dry Run Mode (set to true to preview emails without sending)
+# =============================================================================
+# Dry Run Mode
+# Set to true to preview emails without sending
+# =============================================================================
 dry_run: true
