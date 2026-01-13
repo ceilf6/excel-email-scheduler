@@ -1,0 +1,40 @@
+# Email Scheduler Configuration
+
+# SMTP Server Settings
+smtp:
+  host: "smtp.example.com"
+  port: 587
+  use_tls: true
+  username: "your_email@example.com"
+  password: "your_password"
+
+# Email Settings
+email:
+  # Sender email address
+  from_address: "your_email@example.com"
+  # Email subject template (supports placeholders like {Name})
+  subject: "Hello {Name}"
+  # Email body template (supports placeholders matching xlsx column names)
+  # Use {ColumnName} to reference values from the xlsx file
+  body: |
+    Hi, my name is {Name}, my number is {Number}.
+
+    This is an automated email.
+
+    Best regards,
+    Your Team
+
+# Workspace Settings
+workspace:
+  # Directory containing xlsx files to process
+  path: "./workspace"
+
+# Logging Settings
+logging:
+  # Log level: DEBUG, INFO, WARNING, ERROR
+  level: "INFO"
+  # Log file path (optional, leave empty to disable file logging)
+  file: "./email_scheduler.log"
+
+# Dry Run Mode (set to true to preview emails without sending)
+dry_run: true

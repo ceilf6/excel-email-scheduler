@@ -1,0 +1,3 @@
+# Excel Email Scheduler Dependencies
+openpyxl>=3.1.0
+PyYAML>=6.0
