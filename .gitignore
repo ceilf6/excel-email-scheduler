@@ -3,3 +3,5 @@
 _CONFIG.sh
 
 email_scheduler.log
+
+venv/

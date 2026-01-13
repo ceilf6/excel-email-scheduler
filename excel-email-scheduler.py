@@ -6,16 +6,24 @@ This script reads all xlsx files in the workspace directory and sends emails
 based on a configurable template. Email addresses are extracted from columns
 containing 'Leader' in their names.
 
+Supports multiple authentication methods:
+- Basic SMTP (username/password) for QQ Mail, 163 Mail, etc.
+- Gmail OAuth2 for Gmail accounts
+- Outlook OAuth2 for Outlook/Office365 accounts
+
 Usage:
     python excel-email-scheduler.py [--config CONFIG_PATH] [--dry-run]
 """
 
 import argparse
+import base64
+import json
 import logging
 import os
 import re
 import smtplib
 import sys
+from abc import ABC, abstractmethod
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from pathlib import Path
@@ -24,6 +32,428 @@ from typing import Any
 import yaml
 from openpyxl import load_workbook
 
+
+# =============================================================================
+# Email Sender Abstract Base Class
+# =============================================================================
+
+class EmailSender(ABC):
+    """Abstract base class for email senders."""
+
+    @abstractmethod
+    def send(
+        self,
+        from_addr: str,
+        to_addr: str,
+        subject: str,
+        body: str,
+        logger: logging.Logger
+    ) -> bool:
+        """Send an email."""
+        pass
+
+    @abstractmethod
+    def close(self) -> None:
+        """Clean up resources."""
+        pass
+
+
+# =============================================================================
+# Basic SMTP Email Sender
+# =============================================================================
+
+class BasicSMTPSender(EmailSender):
+    """Email sender using basic SMTP authentication."""
+
+    def __init__(self, config: dict):
+        """
+        Initialize SMTP sender.
+
+        Args:
+            config: SMTP configuration dictionary
+        """
+        self.host = config["host"]
+        self.port = config["port"]
+        self.use_tls = config.get("use_tls", True)
+        self.username = config["username"]
+        self.password = config["password"]
+
+    def send(
+        self,
+        from_addr: str,
+        to_addr: str,
+        subject: str,
+        body: str,
+        logger: logging.Logger
+    ) -> bool:
+        """Send email using SMTP."""
+        try:
+            msg = MIMEMultipart()
+            msg["From"] = from_addr
+            msg["To"] = to_addr
+            msg["Subject"] = subject
+            msg.attach(MIMEText(body, "plain", "utf-8"))
+
+            if self.use_tls:
+                server = smtplib.SMTP(self.host, self.port)
+                server.starttls()
+            else:
+                server = smtplib.SMTP(self.host, self.port)
+
+            server.login(self.username, self.password)
+            server.sendmail(from_addr, to_addr, msg.as_string())
+            server.quit()
+
+            logger.info(f"Email sent successfully to: {to_addr}")
+            return True
+
+        except smtplib.SMTPException as e:
+            logger.error(f"Failed to send email to {to_addr}: {e}")
+            return False
+
+    def close(self) -> None:
+        """No cleanup needed for basic SMTP."""
+        pass
+
+
+# =============================================================================
+# Gmail OAuth2 Email Sender
+# =============================================================================
+
+class GmailOAuth2Sender(EmailSender):
+    """Email sender using Gmail OAuth2 authentication."""
+
+    def __init__(self, config: dict, logger: logging.Logger):
+        """
+        Initialize Gmail OAuth2 sender.
+
+        Args:
+            config: Gmail OAuth2 configuration dictionary
+            logger: Logger instance
+        """
+        try:
+            from google.auth.transport.requests import Request
+            from google.oauth2.credentials import Credentials
+            from google_auth_oauthlib.flow import InstalledAppFlow
+        except ImportError:
+            raise ImportError(
+                "Gmail OAuth2 requires google-auth-oauthlib. "
+                "Install with: pip install google-auth-oauthlib google-auth"
+            )
+
+        self.credentials_file = config["credentials_file"]
+        self.token_file = config["token_file"]
+        self.scopes = config.get("scopes", ["https://www.googleapis.com/auth/gmail.send"])
+
+        self.creds = None
+        self._authenticate(logger, Request, Credentials, InstalledAppFlow)
+
+    def _authenticate(self, logger, Request, Credentials, InstalledAppFlow) -> None:
+        """Authenticate with Gmail OAuth2."""
+        # Load existing token if available
+        if os.path.exists(self.token_file):
+            self.creds = Credentials.from_authorized_user_file(self.token_file, self.scopes)
+
+        # If no valid credentials, authenticate
+        if not self.creds or not self.creds.valid:
+            if self.creds and self.creds.expired and self.creds.refresh_token:
+                logger.info("Refreshing Gmail OAuth2 token...")
+                self.creds.refresh(Request())
+            else:
+                if not os.path.exists(self.credentials_file):
+                    raise FileNotFoundError(
+                        f"Gmail credentials file not found: {self.credentials_file}\n"
+                        "Please download OAuth2 credentials from Google Cloud Console."
+                    )
+                logger.info("Starting Gmail OAuth2 authorization flow...")
+                logger.info("A browser window will open for authorization.")
+                flow = InstalledAppFlow.from_client_secrets_file(
+                    self.credentials_file, self.scopes
+                )
+                self.creds = flow.run_local_server(port=0)
+
+            # Save the token for future use
+            with open(self.token_file, "w") as token:
+                token.write(self.creds.to_json())
+            logger.info(f"Gmail OAuth2 token saved to: {self.token_file}")
+
+    def send(
+        self,
+        from_addr: str,
+        to_addr: str,
+        subject: str,
+        body: str,
+        logger: logging.Logger
+    ) -> bool:
+        """Send email using Gmail API."""
+        try:
+            from googleapiclient.discovery import build
+            from googleapiclient.errors import HttpError
+        except ImportError:
+            raise ImportError(
+                "Gmail API requires google-api-python-client. "
+                "Install with: pip install google-api-python-client"
+            )
+
+        try:
+            # Build the Gmail service
+            service = build("gmail", "v1", credentials=self.creds)
+
+            # Create the email message
+            msg = MIMEMultipart()
+            msg["From"] = from_addr
+            msg["To"] = to_addr
+            msg["Subject"] = subject
+            msg.attach(MIMEText(body, "plain", "utf-8"))
+
+            # Encode the message
+            raw_message = base64.urlsafe_b64encode(msg.as_bytes()).decode("utf-8")
+
+            # Send the email
+            service.users().messages().send(
+                userId="me",
+                body={"raw": raw_message}
+            ).execute()
+
+            logger.info(f"Email sent successfully to: {to_addr}")
+            return True
+
+        except HttpError as e:
+            logger.error(f"Failed to send email to {to_addr}: {e}")
+            return False
+        except Exception as e:
+            logger.error(f"Failed to send email to {to_addr}: {e}")
+            return False
+
+    def close(self) -> None:
+        """No cleanup needed for Gmail OAuth2."""
+        pass
+
+
+# =============================================================================
+# Outlook OAuth2 Email Sender
+# =============================================================================
+
+class OutlookOAuth2Sender(EmailSender):
+    """Email sender using Microsoft OAuth2 authentication."""
+
+    def __init__(self, config: dict, logger: logging.Logger):
+        """
+        Initialize Outlook OAuth2 sender.
+
+        Args:
+            config: Outlook OAuth2 configuration dictionary
+            logger: Logger instance
+        """
+        try:
+            import msal
+        except ImportError:
+            raise ImportError(
+                "Outlook OAuth2 requires msal. "
+                "Install with: pip install msal"
+            )
+
+        self.client_id = config["client_id"]
+        self.client_secret = config.get("client_secret")
+        self.tenant_id = config.get("tenant_id", "common")
+        self.token_cache_file = config.get("token_cache_file", "outlook_token_cache.json")
+        self.scopes = config.get("scopes", ["https://graph.microsoft.com/Mail.Send"])
+
+        self.access_token = None
+        self._authenticate(logger, msal)
+
+    def _load_token_cache(self, msal) -> Any:
+        """Load token cache from file."""
+        cache = msal.SerializableTokenCache()
+        if os.path.exists(self.token_cache_file):
+            with open(self.token_cache_file, "r") as f:
+                cache.deserialize(f.read())
+        return cache
+
+    def _save_token_cache(self, cache: Any) -> None:
+        """Save token cache to file."""
+        if cache.has_state_changed:
+            with open(self.token_cache_file, "w") as f:
+                f.write(cache.serialize())
+
+    def _authenticate(self, logger, msal) -> None:
+        """Authenticate with Microsoft OAuth2."""
+        cache = self._load_token_cache(msal)
+
+        authority = f"https://login.microsoftonline.com/{self.tenant_id}"
+
+        # Create MSAL application
+        app = msal.PublicClientApplication(
+            self.client_id,
+            authority=authority,
+            token_cache=cache
+        )
+
+        # Try to get token from cache
+        accounts = app.get_accounts()
+        if accounts:
+            logger.info("Found cached Outlook account, attempting silent authentication...")
+            result = app.acquire_token_silent(self.scopes, account=accounts[0])
+            if result and "access_token" in result:
+                self.access_token = result["access_token"]
+                self._save_token_cache(cache)
+                logger.info("Outlook OAuth2 authentication successful (from cache)")
+                return
+
+        # Interactive authentication
+        logger.info("Starting Outlook OAuth2 authorization flow...")
+        logger.info("A browser window will open for authorization.")
+
+        result = app.acquire_token_interactive(
+            scopes=self.scopes,
+            prompt="select_account"
+        )
+
+        if "access_token" in result:
+            self.access_token = result["access_token"]
+            self._save_token_cache(cache)
+            logger.info(f"Outlook OAuth2 token cached to: {self.token_cache_file}")
+        else:
+            error = result.get("error_description", result.get("error", "Unknown error"))
+            raise RuntimeError(f"Outlook OAuth2 authentication failed: {error}")
+
+    def send(
+        self,
+        from_addr: str,
+        to_addr: str,
+        subject: str,
+        body: str,
+        logger: logging.Logger
+    ) -> bool:
+        """Send email using Microsoft Graph API."""
+        try:
+            import requests
+        except ImportError:
+            raise ImportError(
+                "Outlook OAuth2 requires requests. "
+                "Install with: pip install requests"
+            )
+
+        try:
+            # Microsoft Graph API endpoint for sending email
+            endpoint = "https://graph.microsoft.com/v1.0/me/sendMail"
+
+            # Prepare email payload
+            email_payload = {
+                "message": {
+                    "subject": subject,
+                    "body": {
+                        "contentType": "Text",
+                        "content": body
+                    },
+                    "toRecipients": [
+                        {
+                            "emailAddress": {
+                                "address": to_addr
+                            }
+                        }
+                    ]
+                },
+                "saveToSentItems": "true"
+            }
+
+            # Send the request
+            headers = {
+                "Authorization": f"Bearer {self.access_token}",
+                "Content-Type": "application/json"
+            }
+
+            response = requests.post(endpoint, headers=headers, json=email_payload)
+
+            if response.status_code == 202:
+                logger.info(f"Email sent successfully to: {to_addr}")
+                return True
+            else:
+                logger.error(
+                    f"Failed to send email to {to_addr}: "
+                    f"Status {response.status_code}, {response.text}"
+                )
+                return False
+
+        except Exception as e:
+            logger.error(f"Failed to send email to {to_addr}: {e}")
+            return False
+
+    def close(self) -> None:
+        """No cleanup needed for Outlook OAuth2."""
+        pass
+
+
+# =============================================================================
+# Dry Run Email Sender (for testing)
+# =============================================================================
+
+class DryRunSender(EmailSender):
+    """Email sender that only logs without sending."""
+
+    def send(
+        self,
+        from_addr: str,
+        to_addr: str,
+        subject: str,
+        body: str,
+        logger: logging.Logger
+    ) -> bool:
+        """Log email details without sending."""
+        logger.info(f"[DRY RUN] Would send email to: {to_addr}")
+        logger.debug(f"[DRY RUN] Subject: {subject}")
+        logger.debug(f"[DRY RUN] Body preview: {body[:100]}...")
+        return True
+
+    def close(self) -> None:
+        """No cleanup needed for dry run."""
+        pass
+
+
+# =============================================================================
+# Email Sender Factory
+# =============================================================================
+
+def create_email_sender(
+    config: dict,
+    logger: logging.Logger,
+    dry_run: bool = False
+) -> EmailSender:
+    """
+    Create an email sender based on configuration.
+
+    Args:
+        config: Configuration dictionary
+        logger: Logger instance
+        dry_run: If True, return a DryRunSender
+
+    Returns:
+        EmailSender instance
+    """
+    if dry_run:
+        return DryRunSender()
+
+    auth_type = config.get("auth_type", "basic").lower()
+
+    if auth_type == "basic":
+        logger.info("Using Basic SMTP authentication")
+        return BasicSMTPSender(config["smtp"])
+
+    elif auth_type == "gmail_oauth2":
+        logger.info("Using Gmail OAuth2 authentication")
+        return GmailOAuth2Sender(config["gmail_oauth2"], logger)
+
+    elif auth_type == "outlook_oauth2":
+        logger.info("Using Outlook OAuth2 authentication")
+        return OutlookOAuth2Sender(config["outlook_oauth2"], logger)
+
+    else:
+        raise ValueError(f"Unknown auth_type: {auth_type}")
+
+
+# =============================================================================
+# Utility Functions
+# =============================================================================
 
 def setup_logging(config: dict) -> logging.Logger:
     """
@@ -41,6 +471,9 @@ def setup_logging(config: dict) -> logging.Logger:
 
     logger = logging.getLogger("email_scheduler")
     logger.setLevel(log_level)
+
+    # Clear existing handlers
+    logger.handlers.clear()
 
     # Console handler
     console_handler = logging.StreamHandler()
@@ -98,19 +531,6 @@ def find_xlsx_files(workspace_path: str) -> list[Path]:
     return xlsx_files
 
 
-def extract_placeholders(template: str) -> list[str]:
-    """
-    Extract placeholder names from a template string.
-
-    Args:
-        template: Template string containing {placeholder} patterns
-
-    Returns:
-        List of placeholder names
-    """
-    return re.findall(r"\{(\w+)\}", template)
-
-
 def fill_template(template: str, row_data: dict[str, Any]) -> str:
     """
     Fill a template string with values from row data.
@@ -142,6 +562,23 @@ def find_leader_columns(headers: list[str]) -> list[str]:
         List of column names containing 'Leader'
     """
     return [h for h in headers if h and "leader" in h.lower()]
+
+
+def is_valid_email(email: str) -> bool:
+    """
+    Check if a string is a valid email address.
+
+    Args:
+        email: String to validate
+
+    Returns:
+        True if valid email format, False otherwise
+    """
+    if not email or not isinstance(email, str):
+        return False
+    # Simple email validation regex
+    pattern = r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$"
+    return bool(re.match(pattern, email.strip()))
 
 
 def read_xlsx_data(file_path: Path, logger: logging.Logger) -> list[dict[str, Any]]:
@@ -184,106 +621,15 @@ def read_xlsx_data(file_path: Path, logger: logging.Logger) -> list[dict[str, An
     return data
 
 
-def create_email_message(
-    from_addr: str,
-    to_addr: str,
-    subject: str,
-    body: str
-) -> MIMEMultipart:
-    """
-    Create an email message.
-
-    Args:
-        from_addr: Sender email address
-        to_addr: Recipient email address
-        subject: Email subject
-        body: Email body
-
-    Returns:
-        MIMEMultipart email message
-    """
-    msg = MIMEMultipart()
-    msg["From"] = from_addr
-    msg["To"] = to_addr
-    msg["Subject"] = subject
-    msg.attach(MIMEText(body, "plain", "utf-8"))
-    return msg
-
-
-def send_email(
-    smtp_config: dict,
-    from_addr: str,
-    to_addr: str,
-    message: MIMEMultipart,
-    logger: logging.Logger,
-    dry_run: bool = False
-) -> bool:
-    """
-    Send an email using SMTP.
-
-    Args:
-        smtp_config: SMTP configuration dictionary
-        from_addr: Sender email address
-        to_addr: Recipient email address
-        message: Email message to send
-        logger: Logger instance
-        dry_run: If True, don't actually send the email
-
-    Returns:
-        True if email was sent successfully, False otherwise
-    """
-    if dry_run:
-        logger.info(f"[DRY RUN] Would send email to: {to_addr}")
-        logger.debug(f"[DRY RUN] Subject: {message['Subject']}")
-        return True
-
-    try:
-        host = smtp_config["host"]
-        port = smtp_config["port"]
-        use_tls = smtp_config.get("use_tls", True)
-        username = smtp_config["username"]
-        password = smtp_config["password"]
-
-        if use_tls:
-            server = smtplib.SMTP(host, port)
-            server.starttls()
-        else:
-            server = smtplib.SMTP(host, port)
-
-        server.login(username, password)
-        server.sendmail(from_addr, to_addr, message.as_string())
-        server.quit()
-
-        logger.info(f"Email sent successfully to: {to_addr}")
-        return True
-
-    except smtplib.SMTPException as e:
-        logger.error(f"Failed to send email to {to_addr}: {e}")
-        return False
-
-
-def is_valid_email(email: str) -> bool:
-    """
-    Check if a string is a valid email address.
-
-    Args:
-        email: String to validate
-
-    Returns:
-        True if valid email format, False otherwise
-    """
-    if not email or not isinstance(email, str):
-        return False
-    # Simple email validation regex
-    pattern = r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$"
-    return bool(re.match(pattern, email.strip()))
-
+# =============================================================================
+# Main Processing Functions
+# =============================================================================
 
 def process_xlsx_file(
     file_path: Path,
     config: dict,
-    logger: logging.Logger,
-    dry_run: bool = False
+    sender: EmailSender,
+    logger: logging.Logger
 ) -> dict[str, int]:
     """
     Process a single xlsx file and send emails.
@@ -291,8 +637,8 @@ def process_xlsx_file(
     Args:
         file_path: Path to the xlsx file
         config: Configuration dictionary
+        sender: EmailSender instance
         logger: Logger instance
-        dry_run: If True, don't actually send emails
 
     Returns:
         Dictionary with statistics (sent, failed, skipped)
@@ -311,7 +657,6 @@ def process_xlsx_file(
 
     # Get email configuration
     email_config = config["email"]
-    smtp_config = config["smtp"]
     subject_template = email_config["subject"]
     body_template = email_config["body"]
     from_addr = email_config["from_address"]
@@ -349,12 +694,9 @@ def process_xlsx_file(
 
             email_addr = str(email_addr).strip()
 
-            # Create and send email
-            message = create_email_message(from_addr, email_addr, subject, body)
-
             logger.info(f"Row {row_num}: Sending email to {email_addr} (column: {leader_col})")
 
-            if send_email(smtp_config, from_addr, email_addr, message, logger, dry_run):
+            if sender.send(from_addr, email_addr, subject, body, logger):
                 stats["sent"] += 1
             else:
                 stats["failed"] += 1
@@ -399,6 +741,13 @@ def main():
     if dry_run:
         logger.info("Running in DRY RUN mode - no emails will be sent")
 
+    # Create email sender
+    try:
+        sender = create_email_sender(config, logger, dry_run)
+    except Exception as e:
+        logger.error(f"Failed to initialize email sender: {e}")
+        sys.exit(1)
+
     # Find xlsx files
     workspace_path = config.get("workspace", {}).get("path", "./workspace")
 
@@ -417,12 +766,16 @@ def main():
     # Process each xlsx file
     total_stats = {"sent": 0, "failed": 0, "skipped": 0}
 
-    for xlsx_file in xlsx_files:
-        logger.info(f"Processing: {xlsx_file.name}")
-        stats = process_xlsx_file(xlsx_file, config, logger, dry_run)
+    try:
+        for xlsx_file in xlsx_files:
+            logger.info(f"Processing: {xlsx_file.name}")
+            stats = process_xlsx_file(xlsx_file, config, sender, logger)
 
-        for key in total_stats:
-            total_stats[key] += stats[key]
+            for key in total_stats:
+                total_stats[key] += stats[key]
+    finally:
+        # Clean up sender resources
+        sender.close()
 
     # Print summary
     logger.info("=" * 50)
